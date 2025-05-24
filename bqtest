@@ -1,0 +1,95 @@
+package io.bitbucket.heapify.snippet.client.gcp;
+
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.PropertyNamingStrategy;
+import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
+import com.google.cloud.bigquery.BigQuery;
+import com.google.cloud.bigquery.Field;
+import com.google.cloud.bigquery.FieldValueList;
+import com.google.cloud.bigquery.Job;
+import com.google.cloud.bigquery.JobId;
+import com.google.cloud.bigquery.JobInfo;
+import com.google.cloud.bigquery.QueryJobConfiguration;
+import com.google.cloud.bigquery.TableResult;
+import rx.Observable;
+
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+import java.util.stream.Collectors;
+
+/**
+ * @author Ray Naldo
+ */
+public class BigQueryClient {
+
+    private final BigQuery bigQuery;
+    private final ObjectMapper objectMapper;
+
+    public BigQueryClient(BigQuery bigQuery) {
+        this.bigQuery = bigQuery;
+        this.objectMapper = new ObjectMapper()
+            .registerModule(new JavaTimeModule())
+            .disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
+            .setPropertyNamingStrategy(PropertyNamingStrategy.SNAKE_CASE);
+    }
+
+    public <T> Observable<T> query(String sql, Class<T> valueType) {
+        return Observable.fromCallable(() -> query(sql))
+            .flatMap(result -> readValues(result, valueType));
+    }
+
+    /*
+     * Based on
+     * https://cloud.google.com/bigquery/docs/quickstarts/quickstart-client-libraries#bigquery_simple_app_query-java
+     */
+    private TableResult query(String sql) throws InterruptedException {
+        QueryJobConfiguration queryJobConfiguration = QueryJobConfiguration
+            .newBuilder(sql)
+            .build();
+
+        JobId jobId = JobId.of(UUID.randomUUID().toString());
+        Job queryJob = bigQuery.create(
+            JobInfo.newBuilder(queryJobConfiguration)
+                .setJobId(jobId)
+                .build()
+        );
+
+        // Wait for the query to complete
+        queryJob = queryJob.waitFor();
+
+        if (queryJob == null) {
+            throw new IllegalStateException("Job no longer exists");
+        } else if (queryJob.getStatus().getError() != null) {
+            // get latest error as message
+            throw new IllegalStateException(queryJob.getStatus().getError().toString());
+        }
+
+        return queryJob.getQueryResults(BigQuery.QueryResultsOption.pageSize(100));
+    }
+
+    private <T> Observable<T> readValues(TableResult result, Class<T> valueType) {
+        final List<String> fieldNames = getFieldNames(result);
+        return Observable.from(result.iterateAll())
+            // no need to map property name, value, and data type manually
+            // let ObjectMapper do the hard work
+            .map(row -> objectMapper.convertValue(getProperties(row, fieldNames), valueType));
+    }
+
+    private static List<String> getFieldNames(TableResult tableResult) {
+        return tableResult.getSchema().getFields()
+            .stream()
+            .map(Field::getName)
+            .collect(Collectors.toList());
+    }
+
+    private static Map<String, Object> getProperties(FieldValueList row, List<String> fieldNames) {
+        Map<String, Object> properties = new HashMap<>(fieldNames.size());
+        for (String fieldName : fieldNames) {
+            properties.put(fieldName, row.get(fieldName).getValue());
+        }
+        return properties;
+    }
+}
